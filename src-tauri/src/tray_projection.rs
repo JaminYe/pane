@@ -86,8 +86,9 @@ pub(crate) fn project_main_tray(
         Some((snapshot, metric))
     });
     let auto_provider = visible.iter().copied().find(|snapshot| {
-        snapshot.id.starts_with("sub2api@")
-            || !ordinary_metrics(snapshot, config.providers.get(&snapshot.id)).is_empty()
+        !ordinary_metrics(snapshot, config.providers.get(&snapshot.id)).is_empty()
+    }).or_else(|| {
+        visible.iter().copied().find(|snapshot| snapshot.id.starts_with("sub2api@"))
     });
     let Some(icon_provider) = active_pinned
         .map(|(snapshot, _)| snapshot)
@@ -340,6 +341,59 @@ mod tests {
             pinned: None,
             locale: "en".into(),
         }
+    }
+
+    #[test]
+    fn sub2api_failed_card_does_not_hide_later_quota_numbers() {
+        for next_id in ["sub2api@healthy", "codex"] {
+            let failed = Snapshot::error("sub2api@failed", "Failed", "HTTP 401".into());
+            let healthy = snapshot(next_id, "Healthy", vec![progress("Weekly", 25.0)]);
+            let cfg = config(&["sub2api@failed", next_id]);
+
+            let result = project_main_tray(&[failed, healthy], &cfg, false);
+
+            assert_eq!(result.icon_mode, MainTrayIconMode::Numbers);
+            assert_eq!(result.remaining_percentages, vec![75]);
+            assert!(result.tooltip.contains("Healthy Weekly: 75% left"));
+            assert!(result.tooltip.contains("Failed: HTTP 401"));
+        }
+    }
+
+    #[test]
+    fn sub2api_failed_cards_keep_errors_without_selecting_disabled_quotas() {
+        let snapshots = vec![
+            Snapshot::error("sub2api@first", "First", "HTTP 401".into()),
+            Snapshot::error("sub2api@second", "Second", "HTTP 403".into()),
+            snapshot("codex", "Codex", vec![progress("Weekly", 25.0)]),
+        ];
+        let mut cfg = config(&["sub2api@first", "sub2api@second", "codex"]);
+        cfg.disabled.push("codex".into());
+        let result = project_main_tray(&snapshots, &cfg, false);
+        assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
+        assert!(result.remaining_percentages.is_empty());
+        assert_eq!(result.tooltip, "Pane\nFirst: HTTP 401\nSecond: HTTP 403");
+        cfg.disabled.push("sub2api@first".into());
+        assert_eq!(project_main_tray(&snapshots, &cfg, false).tooltip, "Pane\nSecond: HTTP 403");
+        cfg.disabled.push("sub2api".into());
+        assert_eq!(project_main_tray(&snapshots, &cfg, false).tooltip, "Pane");
+    }
+
+    #[test]
+    fn sub2api_stale_quota_and_text_keep_their_auto_priority() {
+        let mut first = snapshot("sub2api@first", "First", vec![progress("5h", 60.0)]);
+        first.stale = true;
+        first.error = Some("HTTP 503".into());
+        let healthy = snapshot("codex", "Codex", vec![progress("Weekly", 25.0)]);
+        let cfg = config(&["sub2api@first", "codex"]);
+        let result = project_main_tray(&[first.clone(), healthy.clone()], &cfg, false);
+        assert_eq!(result.remaining_percentages, vec![40]);
+        assert!(result.tooltip.contains("⚠ First 5h: 40% left"));
+
+        first.metrics = vec![Metric::text("Balance", "$5.00".into())];
+        let result = project_main_tray(&[first, healthy], &cfg, false);
+        assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
+        assert!(result.remaining_percentages.is_empty());
+        assert!(result.tooltip.contains("⚠ First Balance: $5.00"));
     }
 
     #[test]
