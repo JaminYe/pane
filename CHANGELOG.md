@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+- **Devin spend no longer fills the C: temp folder.** Pane used to copy
+  the whole Devin CLI sessions database into `%TEMP%\pane-devin-<pid>.db`
+  on every spend refresh. That file is often multiple GB and stays in
+  WAL mode, so a leftover journal grew by another full copy each cycle
+  (tens of GB). **No tracked app is copied into Temp anymore** for
+  spend: Devin, MiniMax, Hermes, and OpenCode are read live and
+  read-only. Cursor's `state.vscdb` is also live-first; a temp copy is
+  the last resort and is refused above 64 MB. Leftover `pane-devin-*`,
+  `pane-minimax-*`, `pane-hermes-*`, `openusage-cursor-*`, and
+  `%APPDATA%\Pane\tmp\openusage-oc-*` files (including leftover
+  `-wal` / `-shm` / `-journal` sidecars) are deleted on the next
+  spend scan.
+
 ### Changed
 - **Pane's website moved to trypane.xyz.** Public links and install
   commands use the new domain. Existing `pane.jazii.dev` updater clients

@@ -2810,6 +2810,7 @@ fn split_csv_row(line: &str) -> Vec<String> {
 }
 
 pub fn collect(cursor_csv: Option<String>) -> Vec<ProviderSpend> {
+    providers::sweep_temp_sqlite_copies();
     pricing::ensure_fresh();
     load_persisted_cache();
     if let Ok(mut t) = touched().lock() {

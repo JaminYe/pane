@@ -79,8 +79,8 @@ Ground rules that apply to every provider:
 ## Cursor
 
 - **Reads:** Cursor's local state database
-  (`%APPDATA%\Cursor\User\globalStorage\state.vscdb` — copied before
-  reading, never modified).
+  (`%APPDATA%\Cursor\User\globalStorage\state.vscdb` — read live,
+  read-only; a Temp copy is last-resort only and capped at 64 MB).
 - **Calls:** `api2.cursor.sh` Connect RPCs (`GetCurrentPeriodUsage`,
   `GetPlanInfo`, `GetCreditGrantsBalance`); the dashboard's
   usage-events CSV export (for spend). `GetCreditGrantsBalance` cents
@@ -100,8 +100,8 @@ Ground rules that apply to every provider:
 
 - **Reads:** the Go key from
   `%USERPROFILE%\.local\share\opencode\auth.json`;
-  `%USERPROFILE%\.local\share\opencode\opencode.db` (copied before
-  reading) for spend — message costs your own OpenCode history already
+  `%USERPROFILE%\.local\share\opencode\opencode.db` (read live,
+  read-only) for spend — message costs your own OpenCode history already
   contains.
 - **Calls:** `opencode.ai/zen/go/v1/usage` (the official account-wide
   usage API, shipped in anomalyco/opencode#16513) — Session / Weekly /
@@ -138,8 +138,8 @@ Ground rules that apply to every provider:
 ## Devin (Devin CLI)
 
 - **Reads:** `%APPDATA%\devin\credentials.toml`;
-  `%APPDATA%\devin\cli\sessions.db` (+ WAL/SHM sidecars, copied before
-  reading) for local spend.
+  `%APPDATA%\devin\cli\sessions.db` (read live, read-only — the WAL is
+  followed in place, never copied to Temp) for local spend.
 - **Calls:** Devin's `GetUserStatus` RPC.
 - **Shows:** weekly/daily quota, extra balance, plan; local spend from
   Devin CLI sessions (cloud Devin sessions bill ACUs and keep no local
@@ -152,8 +152,7 @@ Ground rules that apply to every provider:
   `provider.minimax.options.apiKey` — a same-named key under another
   provider's section is never used); local spend from
   `%USERPROFILE%\.minimax\sqlite.db` (the Agent CLI's per-turn
-  token_usage table, snapshotted via SQLite's backup API — never
-  modified) and from Claude Code sessions that ran against MiniMax's
+  token_usage table, read live and read-only) and from Claude Code sessions that ran against MiniMax's
   Anthropic-compatible endpoint (those log MiniMax models into
   `~\.claude\projects\` and are re-routed here from the Claude card).
 - **Calls:** `api.minimax.io/v1/token_plan/remains` (+ regional fallbacks).
@@ -258,7 +257,8 @@ Ground rules that apply to every provider:
 ## Hermes (Nous Research desktop)
 
 - **Reads:** the Hermes desktop app's local ledger
-  (`%LOCALAPPDATA%\hermes\state.db`, `session_model_usage` table — model,
+  (`%LOCALAPPDATA%\hermes\state.db` — read live, read-only;
+  `session_model_usage` table — model,
   billing route, token buckets, and the app's own cost per session).
   Detected when that file exists; no API key.
 - **Calls:** nothing. This is a purely local source — Hermes records

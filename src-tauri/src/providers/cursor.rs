@@ -28,40 +28,24 @@ fn read_pair(conn: &rusqlite::Connection) -> Result<(Option<String>, Option<Stri
     Ok((get("cursorAuth/accessToken")?, get("cursorAuth/refreshToken")?))
 }
 
-/// Cursor stores its session token in a small SQLite database. The running
-/// Cursor app may hold a lock on it, so we read from a temporary copy —
-/// retried a few times because the copy loses to Cursor's own writes now
-/// and then, and finally via a lock-free immutable open of the original.
+/// Cursor stores its session token in SQLite. Prefer a live read-only
+/// open (WAL-safe, no temp file). A full copy into `%TEMP%` is the last
+/// resort and is refused when the file is over the shared size cap.
 fn read_state_values() -> Result<(Option<String>, Option<String>), String> {
     let Some(db_path) = state_db_path() else {
         return Ok((None, None));
     };
-    let tmp = std::env::temp_dir().join(format!("openusage-cursor-{}.vscdb", std::process::id()));
 
-    let mut copy_err = String::new();
-    for attempt in 0..3 {
-        match std::fs::copy(&db_path, &tmp) {
-            Ok(_) => {
-                let result = rusqlite::Connection::open_with_flags(
-                    &tmp,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .and_then(|conn| read_pair(&conn));
-                let _ = std::fs::remove_file(&tmp);
-                return result.map_err(|e| format!("read state.vscdb: {e}"));
-            }
-            Err(e) => {
-                copy_err = e.to_string();
-                if attempt < 2 {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                }
-            }
+    if let Ok(conn) = super::open_readonly_sqlite(&db_path) {
+        if let Ok(pair) = read_pair(&conn) {
+            return Ok(pair);
         }
     }
 
-    // Copy kept losing to Cursor's lock: open the real file read-only and
-    // immutable (SQLite promises not to write, so no lock is taken).
-    let uri = format!("file:{}?immutable=1", db_path.to_string_lossy().replace('\\', "/"));
+    let uri = format!(
+        "file:{}?immutable=1",
+        db_path.to_string_lossy().replace('\\', "/")
+    );
     match rusqlite::Connection::open_with_flags(
         &uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -69,7 +53,43 @@ fn read_state_values() -> Result<(Option<String>, Option<String>), String> {
     .and_then(|conn| read_pair(&conn))
     {
         Ok(pair) => Ok(pair),
-        Err(e) => Err(format!("copy state.vscdb: {copy_err}; immutable open: {e}")),
+        Err(e) => {
+            if !super::temp_sqlite_copy_allowed(&db_path) {
+                return Err(format!(
+                    "read state.vscdb: {e}; temp copy refused (file over {} bytes)",
+                    super::MAX_TEMP_SQLITE_BYTES
+                ));
+            }
+            read_state_from_capped_copy(&db_path, e.to_string())
+        }
+    }
+}
+
+fn read_state_from_capped_copy(
+    db_path: &std::path::Path,
+    live_err: String,
+) -> Result<(Option<String>, Option<String>), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "openusage-cursor-{}-{}.vscdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    match std::fs::copy(db_path, &tmp) {
+        Ok(_) => {
+            let result = rusqlite::Connection::open_with_flags(
+                &tmp,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|conn| read_pair(&conn));
+            let _ = std::fs::remove_file(&tmp);
+            result.map_err(|e| format!("read state.vscdb copy: {e}"))
+        }
+        Err(e) => Err(format!(
+            "read state.vscdb: {live_err}; copy: {e}"
+        )),
     }
 }
 

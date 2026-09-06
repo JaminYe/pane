@@ -11,16 +11,11 @@
 //! Hermes card. Hermes records ZERO cost itself, so dollars come from
 //! the shared pricing catalog.
 
-use super::minimax::{file_stamp, snapshot_db, FileStamp};
+use super::minimax::{file_stamp, FileStamp};
 use super::{Metric, Snapshot};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const ID: &str = "hermes";
 const NAME: &str = "Hermes";
-
-/// Concurrent card refresh + spend scan each copy the ledger; a per-call
-/// counter keeps their temp files from colliding (same pattern as OpenCode).
-static COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct HermesUsage {
@@ -223,13 +218,7 @@ pub fn collect_usage_events() -> Vec<HermesUsage> {
         }
     }
 
-    let n = COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_base = std::env::temp_dir().join(format!("pane-hermes-{}-{n}", std::process::id()));
-    let tmp_db = tmp_base.with_extension("db");
-    let events = snapshot_db(&db_path, &tmp_db).and_then(|()| read_usage_events(&tmp_db));
-    for suffix in ["db", "db-wal", "db-shm"] {
-        let _ = std::fs::remove_file(tmp_base.with_extension(suffix));
-    }
+    let events = read_usage_events(&db_path);
 
     match events {
         Ok(events) => {
@@ -247,7 +236,7 @@ pub fn collect_usage_events() -> Vec<HermesUsage> {
 }
 
 fn read_usage_events(db: &std::path::Path) -> Result<Vec<HermesUsage>, String> {
-    let conn = rusqlite::Connection::open(db).map_err(|e| format!("open db copy: {e}"))?;
+    let conn = super::open_readonly_sqlite(db)?;
     // Optional columns (session_id, billing_base_url, task) were added as
     // Hermes grew; an older ledger must still yield tokens and cost.
     let cols = table_columns(&conn)?;

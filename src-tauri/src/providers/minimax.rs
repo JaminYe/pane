@@ -7,6 +7,14 @@ use serde_json::Value;
 
 use super::{Metric, Snapshot};
 
+#[cfg(test)]
+pub(crate) const MAX_TEMP_SNAPSHOT_BYTES: u64 = super::MAX_TEMP_SQLITE_BYTES;
+
+#[cfg(test)]
+pub(crate) fn temp_snapshot_allowed(src_len: u64) -> bool {
+    src_len <= MAX_TEMP_SNAPSHOT_BYTES
+}
+
 const ID: &str = "minimax";
 const NAME: &str = "MiniMax";
 
@@ -252,12 +260,7 @@ pub fn collect_usage_events() -> Vec<UsageEvent> {
         }
     }
 
-    let tmp_base = std::env::temp_dir().join(format!("pane-minimax-{}", std::process::id()));
-    let tmp_db = tmp_base.with_extension("db");
-    let events = snapshot_db(&db_path, &tmp_db).and_then(|()| read_usage_events(&tmp_db));
-    for suffix in ["db", "db-wal", "db-shm"] {
-        let _ = std::fs::remove_file(tmp_base.with_extension(suffix));
-    }
+    let events = read_usage_events(&db_path);
 
     match events {
         Ok(events) => {
@@ -274,26 +277,41 @@ pub fn collect_usage_events() -> Vec<UsageEvent> {
     }
 }
 
-/// Consistent point-in-time copy via SQLite's backup API (reads through the
-/// WAL with proper locks, retrying briefly while the writer is busy).
+/// Test-only helper: the production spend path never copies a vendor
+/// ledger into Temp. Kept so we can still prove leftover WAL files are
+/// wiped and oversized sources are refused.
+#[cfg(test)]
 pub(crate) fn snapshot_db(src_path: &std::path::Path, dst_path: &std::path::Path) -> Result<(), String> {
-    let _ = std::fs::remove_file(dst_path);
+    if !super::temp_sqlite_copy_allowed(src_path) {
+        let src_len = std::fs::metadata(src_path).map(|m| m.len()).unwrap_or(0);
+        return Err(format!(
+            "temp snapshot refused: source is {src_len} bytes (cap {})",
+            super::MAX_TEMP_SQLITE_BYTES
+        ));
+    }
+    super::remove_sqlite_files(dst_path);
     let src = rusqlite::Connection::open_with_flags(
         src_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(|e| format!("open live db: {e}"))?;
+    src.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|e| format!("busy timeout: {e}"))?;
     let mut dst =
         rusqlite::Connection::open(dst_path).map_err(|e| format!("open snapshot: {e}"))?;
-    let backup = rusqlite::backup::Backup::new(&src, &mut dst)
-        .map_err(|e| format!("backup init: {e}"))?;
-    backup
-        .run_to_completion(256, std::time::Duration::from_millis(10), None)
-        .map_err(|e| format!("backup run: {e}"))
+    {
+        let backup = rusqlite::backup::Backup::new(&src, &mut dst)
+            .map_err(|e| format!("backup init: {e}"))?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(10), None)
+            .map_err(|e| format!("backup run: {e}"))?;
+    }
+    let _ = dst.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;");
+    Ok(())
 }
 
 fn read_usage_events(db: &std::path::Path) -> Result<Vec<UsageEvent>, String> {
-    let conn = rusqlite::Connection::open(db).map_err(|e| format!("open db copy: {e}"))?;
+    let conn = super::open_readonly_sqlite(db)?;
     let mut stmt = conn
         .prepare(
             "SELECT ts, model, input_tokens, output_tokens, reasoning_tokens,
@@ -339,6 +357,43 @@ mod tests {
         // Short placeholder keys are still rejected.
         let raw = "provider:\n  minimax:\n    options:\n      apiKey: sk-short\n";
         assert_eq!(cli_config_key(raw), None);
+    }
+
+    #[test]
+    fn huge_ledgers_are_not_copied_to_temp() {
+        assert!(super::temp_snapshot_allowed(0));
+        assert!(super::temp_snapshot_allowed(super::MAX_TEMP_SNAPSHOT_BYTES));
+        assert!(!super::temp_snapshot_allowed(super::MAX_TEMP_SNAPSHOT_BYTES + 1));
+    }
+
+    #[test]
+    fn snapshot_db_deletes_leftover_wal_before_copy() {
+        let pid = std::process::id();
+        let src = std::env::temp_dir().join(format!("pane-snap-src-{pid}.db"));
+        let dst = std::env::temp_dir().join(format!("pane-snap-dst-{pid}.db"));
+        crate::providers::remove_sqlite_files(&src);
+        crate::providers::remove_sqlite_files(&dst);
+
+        let conn = rusqlite::Connection::open(&src).unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        let mut leftover = dst.as_os_str().to_os_string();
+        leftover.push("-wal");
+        let leftover = std::path::PathBuf::from(leftover);
+        std::fs::write(&leftover, vec![0u8; 1024 * 1024]).unwrap();
+        assert_eq!(std::fs::metadata(&leftover).unwrap().len(), 1024 * 1024);
+
+        super::snapshot_db(&src, &dst).expect("snapshot should succeed");
+        let wal_len = std::fs::metadata(&leftover).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_len < 64 * 1024,
+            "leftover dest WAL must not survive a fresh snapshot, was {wal_len} bytes"
+        );
+
+        crate::providers::remove_sqlite_files(&src);
+        crate::providers::remove_sqlite_files(&dst);
     }
 
     /// Live probe with this machine's real key — run manually via
