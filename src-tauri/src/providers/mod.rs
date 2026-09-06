@@ -456,6 +456,7 @@ pub(crate) fn open_readonly_sqlite(
 /// Delete a SQLite file and its `-wal` / `-shm` sidecars. Call this before
 /// opening a reused temp destination — removing only the `.db` leaves the
 /// journal, and the next backup appends another full copy to it.
+#[cfg(test)]
 pub(crate) fn remove_sqlite_files(db_path: &std::path::Path) {
     let _ = std::fs::remove_file(db_path);
     let mut wal = db_path.as_os_str().to_os_string();
@@ -464,6 +465,9 @@ pub(crate) fn remove_sqlite_files(db_path: &std::path::Path) {
     let mut shm = db_path.as_os_str().to_os_string();
     shm.push("-shm");
     let _ = std::fs::remove_file(&shm);
+    let mut journal = db_path.as_os_str().to_os_string();
+    journal.push("-journal");
+    let _ = std::fs::remove_file(&journal);
 }
 
 /// Drop leftover Pane temp snapshots in `%TEMP%` (`pane-devin-*.db` and
@@ -484,6 +488,7 @@ fn is_pane_temp_sqlite(name: &str, prefix: &str) -> bool {
     let stem = rest
         .strip_suffix(".db-wal")
         .or_else(|| rest.strip_suffix(".db-shm"))
+        .or_else(|| rest.strip_suffix(".db-journal"))
         .or_else(|| rest.strip_suffix(".db"));
     let Some(stem) = stem else {
         return false;
@@ -547,6 +552,10 @@ mod sqlite_temp_tests {
         assert!(super::is_pane_temp_sqlite(
             "pane-minimax-10568-3.db",
             "pane-minimax-"
+        ));
+        assert!(super::is_pane_temp_sqlite(
+            "pane-devin-16636.db-journal",
+            "pane-devin-"
         ));
         assert!(!super::is_pane_temp_sqlite(
             "pane-hermes-narrow-test-1.db",

@@ -7,8 +7,10 @@ use serde_json::Value;
 
 use super::{Metric, Snapshot};
 
+#[cfg(test)]
 pub(crate) const MAX_TEMP_SNAPSHOT_BYTES: u64 = super::MAX_TEMP_SQLITE_BYTES;
 
+#[cfg(test)]
 pub(crate) fn temp_snapshot_allowed(src_len: u64) -> bool {
     src_len <= MAX_TEMP_SNAPSHOT_BYTES
 }
@@ -275,17 +277,16 @@ pub fn collect_usage_events() -> Vec<UsageEvent> {
     }
 }
 
-/// Consistent point-in-time copy via SQLite's backup API (reads through the
-/// WAL with proper locks, retrying briefly while the writer is busy).
-///
-/// Sidecars are deleted first. Destination DBs inherit WAL mode from the
-/// source; we checkpoint and switch them to DELETE so a leftover journal
-/// cannot grow by another full copy on the next refresh.
+/// Test-only helper: the production spend path never copies a vendor
+/// ledger into Temp. Kept so we can still prove leftover WAL files are
+/// wiped and oversized sources are refused.
+#[cfg(test)]
 pub(crate) fn snapshot_db(src_path: &std::path::Path, dst_path: &std::path::Path) -> Result<(), String> {
     if !super::temp_sqlite_copy_allowed(src_path) {
         let src_len = std::fs::metadata(src_path).map(|m| m.len()).unwrap_or(0);
         return Err(format!(
-            "temp snapshot refused: source is {src_len} bytes (cap {MAX_TEMP_SNAPSHOT_BYTES})"
+            "temp snapshot refused: source is {src_len} bytes (cap {})",
+            super::MAX_TEMP_SQLITE_BYTES
         ));
     }
     super::remove_sqlite_files(dst_path);

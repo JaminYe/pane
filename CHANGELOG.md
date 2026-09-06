@@ -12,7 +12,8 @@
   read-only. Cursor's `state.vscdb` is also live-first; a temp copy is
   the last resort and is refused above 64 MB. Leftover `pane-devin-*`,
   `pane-minimax-*`, `pane-hermes-*`, `openusage-cursor-*`, and
-  `%APPDATA%\Pane\tmp\openusage-oc-*` files are deleted on the next
+  `%APPDATA%\Pane\tmp\openusage-oc-*` files (including leftover
+  `-wal` / `-shm` / `-journal` sidecars) are deleted on the next
   spend scan.
 
 ### Changed
