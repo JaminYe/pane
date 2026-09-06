@@ -428,3 +428,145 @@ pub fn stored_api_key(provider: &str, env_vars: &[&str]) -> Option<String> {
     }
     None
 }
+
+/// Hard cap for any leftover temp copy path. Multi-GB ledgers (Devin) must
+/// never be cloned onto C:.
+pub(crate) const MAX_TEMP_SQLITE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub(crate) fn temp_sqlite_copy_allowed(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len())
+        .unwrap_or(u64::MAX)
+        <= MAX_TEMP_SQLITE_BYTES
+}
+
+pub(crate) fn open_readonly_sqlite(
+    path: &std::path::Path,
+) -> Result<rusqlite::Connection, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("open live db: {e}"))?;
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|e| format!("busy timeout: {e}"))?;
+    Ok(conn)
+}
+
+/// Delete a SQLite file and its `-wal` / `-shm` sidecars. Call this before
+/// opening a reused temp destination — removing only the `.db` leaves the
+/// journal, and the next backup appends another full copy to it.
+pub(crate) fn remove_sqlite_files(db_path: &std::path::Path) {
+    let _ = std::fs::remove_file(db_path);
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let _ = std::fs::remove_file(&wal);
+    let mut shm = db_path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let _ = std::fs::remove_file(&shm);
+}
+
+/// Drop leftover Pane temp snapshots in `%TEMP%` (`pane-devin-*.db` and
+/// friends). A crashed or overlapping spend scan used to leave multi-GB
+/// WAL journals on C:.
+pub fn sweep_temp_sqlite_copies() {
+    for prefix in ["pane-devin-", "pane-minimax-", "pane-hermes-"] {
+        sweep_temp_sqlite_prefix(prefix);
+    }
+    sweep_temp_prefix_ext("openusage-cursor-", &[".vscdb", ".vscdb-wal", ".vscdb-shm"]);
+    sweep_opencode_scratch();
+}
+
+fn is_pane_temp_sqlite(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let stem = rest
+        .strip_suffix(".db-wal")
+        .or_else(|| rest.strip_suffix(".db-shm"))
+        .or_else(|| rest.strip_suffix(".db"));
+    let Some(stem) = stem else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem.chars().all(|c| c.is_ascii_digit() || c == '-')
+        && stem.chars().any(|c| c.is_ascii_digit())
+}
+
+pub(crate) fn sweep_temp_sqlite_prefix(prefix: &str) {
+    sweep_temp_dir(std::env::temp_dir(), |name| is_pane_temp_sqlite(name, prefix));
+}
+
+fn sweep_temp_prefix_ext(prefix: &str, suffixes: &[&str]) {
+    sweep_temp_dir(std::env::temp_dir(), |name| {
+        name.starts_with(prefix) && suffixes.iter().any(|s| name.ends_with(s))
+    });
+}
+
+fn sweep_opencode_scratch() {
+    let dir = config_dir().join("tmp");
+    sweep_temp_dir(dir, |name| name.starts_with("openusage-oc-"));
+}
+
+fn sweep_temp_dir(dir: std::path::PathBuf, keep: impl Fn(&str) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if keep(name) {
+            let _ = std::fs::remove_file(ent.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod sqlite_temp_tests {
+    #[test]
+    fn sweep_removes_devin_temp_journals() {
+        let marker = std::env::temp_dir().join(format!(
+            "pane-devin-{}-9.db-wal",
+            std::process::id()
+        ));
+        std::fs::write(&marker, b"leftover").unwrap();
+        assert!(marker.exists());
+        super::sweep_temp_sqlite_prefix("pane-devin-");
+        assert!(
+            !marker.exists(),
+            "sweep must delete leftover pane-devin journals"
+        );
+    }
+
+    #[test]
+    fn sweep_skips_unrelated_temp_names() {
+        assert!(super::is_pane_temp_sqlite(
+            "pane-devin-10568.db-wal",
+            "pane-devin-"
+        ));
+        assert!(super::is_pane_temp_sqlite(
+            "pane-minimax-10568-3.db",
+            "pane-minimax-"
+        ));
+        assert!(!super::is_pane_temp_sqlite(
+            "pane-hermes-narrow-test-1.db",
+            "pane-hermes-"
+        ));
+        assert!(!super::is_pane_temp_sqlite("other-10568.db", "pane-devin-"));
+    }
+
+    #[test]
+    fn huge_sqlite_files_are_never_copied() {
+        assert!(super::temp_sqlite_copy_allowed(std::path::Path::new(".")));
+        let huge = std::env::temp_dir().join(format!(
+            "pane-size-cap-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        // Don't write 64MB; the helper treats a missing file as too large.
+        assert!(!super::temp_sqlite_copy_allowed(&huge));
+    }
+}

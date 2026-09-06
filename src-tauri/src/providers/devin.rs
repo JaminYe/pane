@@ -55,6 +55,39 @@ mod tests {
         assert_eq!(zero_when_omitted(None, None), None);
     }
 
+    #[test]
+    fn usage_events_read_live_file_read_only() {
+        let path = std::env::temp_dir().join(format!(
+            "devin-usage-read-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT);
+            CREATE TABLE message_nodes (
+                session_id TEXT, chat_message TEXT, created_at INTEGER
+            );
+            INSERT INTO sessions VALUES ('s1', 'claude-sonnet-4');
+            INSERT INTO message_nodes VALUES (
+                's1',
+                '{"role":"assistant","message_id":"m1","metadata":{"metrics":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"cache_creation_tokens":0},"created_at":"2026-09-06T00:00:00Z"}}',
+                1757116800
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = read_usage_events(&path).expect("read-only live query");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input, 10.0);
+        assert_eq!(events[0].output, 4.0);
+        assert_eq!(events[0].model, "claude-sonnet-4");
+    }
+
     /// Live diagnostic (ignored): prints the raw planStatus so quota
     /// misreports can be debugged against real account states (never
     /// prints the key). Run:
@@ -254,13 +287,18 @@ fn file_stamp(path: &std::path::Path) -> FileStamp {
 /// the store keeps one row per message per branch of the session's message
 /// forest, so rows dedupe by (session, message id). The model is tracked
 /// per session. Cloud Devin sessions bill ACUs and never land in this db —
-/// only CLI usage shows up. Parsed results are cached so the 37 MB file
-/// isn't copied on every refresh; the cache keys on the main db AND the
-/// WAL sidecar, because SQLite appends new rows to the -wal without
-/// touching the main file until a checkpoint runs.
+/// only CLI usage shows up.
+///
+/// The live file is often multiple GB. Copying it into `%TEMP%` via the
+/// backup API inherited WAL mode and, when the dest journal survived a
+/// refresh, grew by another full copy each cycle (tens of GB on C:).
+/// Readers in WAL mode already see a consistent snapshot, so we query
+/// the live file read-only and never write a temp copy.
 pub fn collect_usage_events() -> Vec<UsageEvent> {
     use std::sync::Mutex;
     static CACHE: Mutex<Option<(FileStamp, FileStamp, Vec<UsageEvent>)>> = Mutex::new(None);
+
+    super::sweep_temp_sqlite_prefix("pane-devin-");
 
     let Some(db_path) = sessions_db_path() else { return Vec::new() };
     if !db_path.exists() {
@@ -277,17 +315,7 @@ pub fn collect_usage_events() -> Vec<UsageEvent> {
         }
     }
 
-    // Snapshot through SQLite's backup API rather than copying files: the
-    // Devin app writes new rows to the WAL continuously, and a raw copy of
-    // db + WAL taken at slightly different instants makes SQLite silently
-    // discard the WAL — recent sessions would just vanish from the totals.
-    let tmp_base = std::env::temp_dir().join(format!("pane-devin-{}", std::process::id()));
-    let tmp_db = tmp_base.with_extension("db");
-    let events = snapshot_db(&db_path, &tmp_db).and_then(|()| read_usage_events(&tmp_db));
-
-    for suffix in ["db", "db-wal", "db-shm"] {
-        let _ = std::fs::remove_file(tmp_base.with_extension(suffix));
-    }
+    let events = read_usage_events(&db_path);
 
     match events {
         Ok(events) => {
@@ -306,26 +334,8 @@ pub fn collect_usage_events() -> Vec<UsageEvent> {
     }
 }
 
-/// Consistent point-in-time copy of the live db (reads through the WAL
-/// with proper locks, retrying briefly while the writer is busy).
-fn snapshot_db(src_path: &std::path::Path, dst_path: &std::path::Path) -> Result<(), String> {
-    let _ = std::fs::remove_file(dst_path);
-    let src = rusqlite::Connection::open_with_flags(
-        src_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("open live db: {e}"))?;
-    let mut dst =
-        rusqlite::Connection::open(dst_path).map_err(|e| format!("open snapshot: {e}"))?;
-    let backup = rusqlite::backup::Backup::new(&src, &mut dst)
-        .map_err(|e| format!("backup init: {e}"))?;
-    backup
-        .run_to_completion(256, std::time::Duration::from_millis(10), None)
-        .map_err(|e| format!("backup run: {e}"))
-}
-
 fn read_usage_events(db: &std::path::Path) -> Result<Vec<UsageEvent>, String> {
-    let conn = rusqlite::Connection::open(db).map_err(|e| format!("open db copy: {e}"))?;
+    let conn = super::open_readonly_sqlite(db)?;
     let mut stmt = conn
         .prepare(
             "SELECT m.session_id, m.chat_message, m.created_at, s.model
