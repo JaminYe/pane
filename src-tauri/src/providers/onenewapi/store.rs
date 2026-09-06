@@ -103,7 +103,7 @@ pub fn save(path: &Path, doc: &StoreFile) -> Result<(), String> {
     atomic_write(path, &raw)
 }
 
-fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "onenewapi.json path is missing a directory".to_string())?;
@@ -152,7 +152,7 @@ fn create_empty(path: &Path) -> Result<(), String> {
     }
 }
 
-fn restrict_owner_only(path: &Path) -> Result<(), String> {
+pub(crate) fn restrict_owner_only(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         let sid = current_user_sid()?;
