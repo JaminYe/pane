@@ -192,6 +192,14 @@ fn quota(label: &str, value: &serde_json::Value, metrics: &mut Vec<Metric>) -> b
         }
     }
     metric.resets_at = reset.map(|d| d.timestamp_millis());
+    // Only these windows have authoritative fixed durations. Subscription
+    // allowances and total quota must not acquire an invented reset period.
+    metric.period_ms = match label {
+        "5h" => Some(5 * 60 * 60 * 1000),
+        "1d" => Some(24 * 60 * 60 * 1000),
+        "7d" => Some(7 * 24 * 60 * 60 * 1000),
+        _ => None,
+    };
     metrics.push(metric);
     used.zip(limit).is_some_and(|(u, l)| u >= l) || remaining.is_some_and(|r| r <= 0.0)
 }
@@ -482,6 +490,31 @@ mod tests {
             .iter()
             .find(|m| m.label == label)
             .unwrap_or_else(|| panic!("missing {label}"))
+    }
+
+    #[tokio::test]
+    async fn rolling_quota_refresh_drives_pace_alerts_before_exhaustion() {
+        let cfg = json!({"notifyCuttingClose":true,"notifyWillRunOut":true,"locale":"en"});
+        for (window, duration) in [("5h", 18_000_000_i64), ("1d", 86_400_000), ("7d", 604_800_000)] {
+            let id = format!("sub2api@pace-{window}");
+            crate::alerts::forget_snapshot(&id);
+            let reset = chrono::Utc::now() + chrono::Duration::milliseconds(duration / 2);
+            for (used, expected) in [(20, None), (47, Some("Cutting It Close")), (60, Some("Will Run Out")), (60, None)] {
+                let mut snapshot = response(json!({"mode":"quota_limited",
+                    "rate_limits":[{"window":window,"used":used,"limit":100,"reset_at":reset.to_rfc3339()}]})).await;
+                snapshot.id = id.clone();
+                assert_eq!(snapshot.status, "ok");
+                let alerts = crate::alerts::evaluate(&[snapshot], &cfg);
+                assert_eq!(alerts.first().map(|alert| alert.title.as_str()), expected, "{window} at {used}%");
+                assert_eq!(alerts.len(), usize::from(expected.is_some()));
+            }
+            let mut next_period = response(json!({"mode":"quota_limited",
+                "rate_limits":[{"window":window,"used":60,"limit":100,
+                    "reset_at":(reset + chrono::Duration::milliseconds(duration)).to_rfc3339()}]})).await;
+            next_period.id = id.clone();
+            assert!(crate::alerts::evaluate(&[next_period], &cfg).is_empty());
+            crate::alerts::forget_snapshot(&id);
+        }
     }
 
     #[tokio::test]

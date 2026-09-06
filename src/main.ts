@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { reconcileSub2ApiLayout, sub2ApiOnDemand, sub2ApiPrimaryMetric, Sub2ApiSnapshotContexts, sub2ApiStatusDetails } from "./sub2api-display";
+import { reconcileSub2ApiLayout, sub2ApiLiveLayout, sub2ApiOnDemand, sub2ApiPrimaryMetric, Sub2ApiSnapshotContexts, sub2ApiStatusDetails } from "./sub2api-display";
 import {
   applyStaticI18n,
   displayLinkLabel,
@@ -906,7 +906,8 @@ function ensureLayout(): void {
     const alwaysVisible = L.metricOrder.filter(
       (k) => !L.onDemand.includes(k) && !L.hidden.includes(k),
     );
-    if (alwaysVisible.length === 0) {
+    // Partial Sub2API responses must not rewrite saved on-demand preferences.
+    if (alwaysVisible.length === 0 && providerFamily(s.id) !== "sub2api") {
       const own = new Set(s.metrics.map((m) => m.label));
       if (s.metrics.length > 0 && L.onDemand.some((k) => own.has(k))) {
         L.onDemand = L.onDemand.filter((k) => !own.has(k));
@@ -929,6 +930,13 @@ function providerLayout(id: string): ProviderLayout {
       expanded: false,
     }
   );
+}
+
+function liveProviderLayout(id: string): ProviderLayout {
+  const layout = providerLayout(id);
+  return providerFamily(id) === "sub2api"
+    ? sub2ApiLiveLayout(lastSnapshots.find((s) => s.id === id)?.metrics ?? [], layout)
+    : layout;
 }
 
 function saveLayout(syncTray = true): void {
@@ -1192,7 +1200,7 @@ function renderCard(s: Snapshot): string {
   let body: string;
   let caret = "";
   if (s.status === "ok") {
-    const L = providerLayout(s.id);
+    const L = providerFamily(s.id) === "sub2api" ? sub2ApiLiveLayout(s.metrics, providerLayout(s.id)) : providerLayout(s.id);
     const spend = lastSpend.find((sp) => sp.id === s.id);
     const visible = L.metricOrder.filter((k) => !L.hidden.includes(k));
     const always = visible.filter((k) => !L.onDemand.includes(k));
@@ -2328,7 +2336,7 @@ function renderCustomize(): string {
       // ("Claude — Org"); static providers come from the fixed list.
       const name =
         ALL_PROVIDERS.find(([pid]) => pid === id)?.[1] ?? snapshot?.name ?? siteKeyManager(id)?.cardName(id) ?? id;
-      const L = providerLayout(id);
+      const L = liveProviderLayout(id);
       // Per-row checkbox is exact-id only: family `onenewapi` stays its
       // own toggle, and key cards keep independent enable state while
       // the family is off.
@@ -2373,7 +2381,7 @@ function renderCustomize(): string {
     })
     .join("");
 
-  const starCount = Object.values(config.layout?.providers ?? {}).reduce((n, l) => n + l.starred.length, 0);
+  const starCount = Object.keys(config.layout?.providers ?? {}).reduce((n, id) => n + liveProviderLayout(id).starred.length, 0);
   return `
     <div class="customize-bar glass-bar">
       <button class="dock-btn" data-customize-close>${escapeHtml(t("customize.done"))}</button>
@@ -2858,7 +2866,7 @@ function captureTraySyncState(): TraySyncState {
   const providerOrder = [...(config.layout?.providerOrder ?? [])];
   const providers: Record<string, TrayProjectionProvider> = {};
   for (const id of providerOrder) {
-    const layout = providerLayout(id);
+    const layout = liveProviderLayout(id);
     providers[id] = {
       metricOrder: [...layout.metricOrder],
       hidden: [...layout.hidden],
@@ -3050,9 +3058,9 @@ function handleCustomizeClick(target: HTMLElement): boolean {
   if (star) {
     const [id, key] = star.dataset.star!.split("|");
     const L = providerLayout(id);
-    if (L.starred.includes(key)) {
+    if (liveProviderLayout(id).starred.includes(key)) {
       L.starred = L.starred.filter((k) => k !== key);
-    } else if (L.starred.length >= 2) {
+    } else if (liveProviderLayout(id).starred.length >= 2) {
       document.querySelector("#status")!.textContent = t("footer.twoStars");
       return true;
     } else {

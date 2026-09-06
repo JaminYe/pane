@@ -65,18 +65,9 @@ export function sub2ApiPrimaryMetric<M extends DisplayMetric>(metrics: M[]): M |
 }
 
 export function reconcileSub2ApiLayout(metrics: DisplayMetric[], layout: MetricLayout): boolean {
-  // Replace mode-specific rows instead of keeping old wallet/subscription rows
-  // in Customize. Existing live row choices and the card identity remain stable.
-  const live = new Set(metrics.map((metric) => metric.label));
+  // A successful response may omit allowances temporarily. Keep their saved
+  // preferences; display projections hide rows absent from the current snapshot.
   let changed = false;
-  for (const field of ["metricOrder", "onDemand", "hidden", "starred"] as const) {
-    const current = layout[field];
-    const next = current.filter((label) => live.has(label));
-    if (current.length !== next.length) {
-      layout[field] = next;
-      changed = true;
-    }
-  }
   for (const metric of metrics) {
     if (layout.metricOrder.includes(metric.label)) continue;
     if (sub2ApiOnDemand(metric.label)) {
@@ -89,4 +80,22 @@ export function reconcileSub2ApiLayout(metrics: DisplayMetric[], layout: MetricL
     changed = true;
   }
   return changed;
+}
+
+// Only current rows participate in display; saved preferences remain dormant.
+export function sub2ApiLiveLayout<L extends MetricLayout>(metrics: DisplayMetric[], layout: L): L {
+  const live = new Set(metrics.map((metric) => metric.label));
+  const projected = {
+    ...layout,
+    metricOrder: layout.metricOrder.filter((label) => live.has(label)),
+    onDemand: layout.onDemand.filter((label) => live.has(label)),
+    hidden: layout.hidden.filter((label) => live.has(label)),
+    // Returning preferences keep their order; at most two stars are active.
+    starred: layout.starred.filter((label) => live.has(label)).slice(0, 2),
+  };
+  if (!projected.metricOrder.some((label) => !projected.hidden.includes(label) && !projected.onDemand.includes(label))) {
+    // Keep available content visible without rewriting saved fold preferences.
+    projected.onDemand = [];
+  }
+  return projected;
 }
